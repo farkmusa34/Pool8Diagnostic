@@ -1,6 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <stdint.h>
 
 static NSMutableArray<NSString *> *P8Logs;
 static UITextView *P8TextView;
@@ -41,7 +43,7 @@ static void P8Log(NSString *message) {
     P8Panel.hidden = YES;
     [self.view addSubview:P8Panel];
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, width - 24, 30)];
-    title.text = @"Pool8 Diagnostic V1";
+    title.text = @"Pool8 Diagnostic V2";
     title.textColor = UIColor.whiteColor;
     title.font = [UIFont boldSystemFontOfSize:16];
     [P8Panel addSubview:title];
@@ -65,7 +67,7 @@ static void P8Log(NSString *message) {
         [b addTarget:self action:NSSelectorFromString(actions[i]) forControlEvents:UIControlEventTouchUpInside];
         [P8Panel addSubview:b];
     }
-    P8Log(@"Diagnostic UI ready. No prediction hooks installed.");
+    P8Log(@"Diagnostic UI ready. Runtime address inspection enabled; prediction hooks not installed.");
 }
 - (void)drag:(UIPanGestureRecognizer *)gesture {
     CGPoint delta = [gesture translationInView:self.view];
@@ -85,7 +87,45 @@ static void P8Log(NSString *message) {
         const char *name = _dyld_get_image_name(i);
         if (name && (strstr(name, "libloader") || strstr(name, "pool.app"))) P8Log([NSString stringWithFormat:@"IMAGE %s", name]);
     }
-    P8Log(@"Prediction inputs/outputs unavailable: hooks not installed");
+    BOOL found = NO;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "libloader.framework/libloader")) continue;
+        const struct mach_header *header = _dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (!header || header->magic != MH_MAGIC_64) {
+            P8Log(@"LIBLOADER: unexpected Mach-O header; skipping address calculation");
+            continue;
+        }
+        const struct mach_header_64 *h = (const struct mach_header_64 *)header;
+        uintptr_t textVM = 0;
+        BOOL textFound = NO;
+        const uint8_t *cursor = (const uint8_t *)(h + 1);
+        for (uint32_t j = 0; j < h->ncmds; j++) {
+            const struct load_command *cmd = (const struct load_command *)cursor;
+            if (cmd->cmdsize < sizeof(struct load_command)) break;
+            if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(struct segment_command_64)) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cursor;
+                if (strncmp(seg->segname, "__TEXT", 16) == 0) {
+                    textVM = (uintptr_t)seg->vmaddr;
+                    textFound = YES;
+                    break;
+                }
+            }
+            cursor += cmd->cmdsize;
+        }
+        if (!textFound) {
+            P8Log(@"LIBLOADER: __TEXT segment not found");
+            continue;
+        }
+        found = YES;
+        uintptr_t base = (uintptr_t)((intptr_t)textVM + slide);
+        P8Log([NSString stringWithFormat:@"LIBLOADER image=%p | slide=%p | __TEXT base=%p", header, (void *)slide, (void *)base]);
+        P8Log([NSString stringWithFormat:@"CANDIDATE trajectory reader VM=0x28E09C runtime=%p", (void *)(base + 0x28E09C)]);
+        P8Log([NSString stringWithFormat:@"CANDIDATE trajectory comparator VM=0x28C390 runtime=%p", (void *)(base + 0x28C390)]);
+    }
+    if (!found) P8Log(@"LIBLOADER: not found or unable to inspect __TEXT");
+    P8Log(@"Prediction values/call counts unavailable: no function hooks installed");
 }
 @end
 
